@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ====== Token & Port ======
-TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+TOKEN = "8745236717:AAGjIacCY4SC2CtIFqDQAv5oZUEInFBg-Nk"
 PORT = int(os.environ.get("PORT", 8080))
 
 # ====== Web Server (لـ Render) ======
