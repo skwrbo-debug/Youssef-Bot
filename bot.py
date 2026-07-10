@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ====== Token & Port ======
 TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 
