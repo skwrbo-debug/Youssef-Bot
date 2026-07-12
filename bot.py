@@ -1,28 +1,16 @@
-import os
 import logging
-import groq
+import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ========== (1) قراءة المفاتيح من متغيرات البيئة ==========
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# ========== المفاتيح ==========
+TELEGRAM_TOKEN = "8745236717:AAGjIacCY4SC2CtIFqDQAv4oZUEInFBg-Nk"
+GROQ_API_KEY = "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"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# التحقق من وجود المفاتيح
-if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-    raise ValueError("❌ ناقص متغيرات البيئة! شغل: export TELEGRAM_TOKEN=... && export GROQ_API_KEY=...")
-
-# ============================================================
-
-client = groq.Groq(api_key=GROQ_API_KEY)
 conversations = {}
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-# الشخصيات
 PERSONAS = {
     "🤖 افتراضي": "أنت مساعد ذكي ومفيد. أجب بوضوح وباللغة العربية.",
     "😂 مضحك": "أنت كوميدي ومضحك. أجب بطريقة مرحة وخفيفة، واستخدم النكت.",
@@ -41,77 +29,52 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
-    await update.message.reply_text(
-        "🌟 **أهلاً بك في البوت الأسطوري!**\n\n"
-        "أنا بوت شامل بستخدم GROQ، أستطيع الرد على أي سؤال.\n"
-        "اختر شخصية من الأسفل، أو اكتب رسالتك مباشرة.",
-        reply_markup=get_main_keyboard()
-    )
+async def start(update, context):
+    uid = update.effective_user.id
+    conversations[uid] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
+    await update.message.reply_text("🌟 أهلاً بك! اختر شخصية أو اكتب رسالتك.", reply_markup=get_main_keyboard())
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_text = update.message.text
+async def handle_message(update, context):
+    uid = update.effective_user.id
+    text = update.message.text
 
-    if user_text in PERSONAS:
-        conversations[user_id] = {"persona": PERSONAS[user_text], "history": []}
-        await update.message.reply_text(
-            f"✅ تم تغيير الشخصية إلى: {user_text}",
-            reply_markup=get_main_keyboard()
-        )
+    if text in PERSONAS:
+        conversations[uid] = {"persona": PERSONAS[text], "history": []}
+        await update.message.reply_text(f"✅ تم تغيير الشخصية إلى: {text}", reply_markup=get_main_keyboard())
         return
 
-    if user_text == "🗑 مسح الذاكرة":
-        persona = conversations.get(user_id, {}).get("persona", PERSONAS["🤖 افتراضي"])
-        conversations[user_id] = {"persona": persona, "history": []}
-        await update.message.reply_text(
-            "🧹 تم مسح الذاكرة.",
-            reply_markup=get_main_keyboard()
-        )
+    if text == "🗑 مسح الذاكرة":
+        p = conversations.get(uid, {}).get("persona", PERSONAS["🤖 افتراضي"])
+        conversations[uid] = {"persona": p, "history": []}
+        await update.message.reply_text("🧹 تم مسح الذاكرة.", reply_markup=get_main_keyboard())
         return
 
-    if user_id not in conversations:
-        conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
+    if uid not in conversations:
+        conversations[uid] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
 
-    user_data = conversations[user_id]
-
-    messages = [{"role": "system", "content": user_data['persona']}]
-    
-    for entry in user_data["history"][-10:]:
-        messages.append({"role": "user", "content": entry["user"]})
-        messages.append({"role": "assistant", "content": entry["bot"]})
-    
-    messages.append({"role": "user", "content": user_text})
+    data = conversations[uid]
+    msgs = [{"role": "system", "content": data["persona"]}]
+    for h in data["history"][-10:]:
+        msgs.append({"role": "user", "content": h["user"]})
+        msgs.append({"role": "assistant", "content": h["bot"]})
+    msgs.append({"role": "user", "content": text})
 
     try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing"
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        r = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama3-8b-8192", "messages": msgs, "temperature": 0.7, "max_tokens": 1024},
+            timeout=30
         )
-
-        chat_completion = client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=1024
-        )
-
-        reply = chat_completion.choices[0].message.content
-        user_data["history"].append({"user": user_text, "bot": reply})
-        
-        if len(user_data["history"]) > 50:
-            user_data["history"] = user_data["history"][-50:]
-
+        r.raise_for_status()
+        reply = r.json()["choices"][0]["message"]["content"]
+        data["history"].append({"user": text, "bot": reply})
+        if len(data["history"]) > 50:
+            data["history"] = data["history"][-50:]
         await update.message.reply_text(reply, reply_markup=get_main_keyboard())
-
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text(
-            f"⚠️ صار خطأ: {str(e)}",
-            reply_markup=get_main_keyboard()
-        )
+        await update.message.reply_text(f"⚠️ خطأ: {e}", reply_markup=get_main_keyboard())
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
