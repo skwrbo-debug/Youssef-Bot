@@ -1,3 +1,2 @@
-cd Youssef-Bot
-git pull
-python bot.py
+python-telegram-bot>=20.0
+requests
