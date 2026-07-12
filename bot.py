@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import logging
 import time
@@ -19,9 +22,12 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("❌ ضع التوكنات في متغيرات البيئة:\n"
-                     "export TELEGRAM_TOKEN='توكنك'\n"
-                     "export GEMINI_API_KEY='مفتاحك'")
+    raise ValueError(
+        "❌ التوكنات ناقصة!\n"
+        "أنشئ ملف .env في نفس المجلد واكتب فيه:\n"
+        "TELEGRAM_TOKEN=توكنك\n"
+        "GEMINI_API_KEY=مفتاحك"
+    )
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -105,7 +111,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     session = conversations.get(user_id)
     if session and (now - session.last_message_time) < RATE_LIMIT_SEC:
-        await update.message.reply_text("⏳ *بطّل شوي...*", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⏳ *بطّل شوي...* أرسل رسالة كل ثانيتين.",
+            parse_mode="Markdown",
+        )
         return
     
     # --- تغيير الشخصية ---
@@ -133,7 +142,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- التحقق من الطول ---
     if len(user_text) > MAX_TEXT_LEN:
         await update.message.reply_text(
-            "⚠️ الرسالة طويلة جداً. اختصرها.",
+            "⚠️ الرسالة طويلة جداً. اختصرها وأعد الإرسال.",
             reply_markup=get_main_keyboard(),
         )
         return
@@ -145,7 +154,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = conversations[user_id]
     session.last_message_time = now
     
-    # --- بناء المحادثة ---
+    # --- بناء المحادثة لـ Gemini (الذاكرة الفعلية) ---
     history_text = ""
     for turn in session.history:
         history_text += f"المستخدم: {turn['user']}\nأنت: {turn['bot']}\n\n"
@@ -179,13 +188,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except genai.types.BlockedPromptException:
         await update.message.reply_text(
-            "🚫 تم حظر هذا الطلب لأسباب أمان.",
+            "🚫 تم حظر هذا الطلب لأسباب أمان. جرّب صياغة مختلفة.",
             reply_markup=get_main_keyboard(),
         )
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error for user {user_id}: {e}")
         await update.message.reply_text(
-            "⚠️ حدث خطأ تقني. جرّب مرة أخرى.",
+            "⚠️ حدث خطأ تقني. جرّب مرة أخرى بعد لحظات.",
             reply_markup=get_main_keyboard(),
         )
 
