@@ -1,147 +1,124 @@
 import os
-import time
-import requests
-from collections import deque
+import logging
+import groq
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-import telebot
+# ========== (1) قراءة المفاتيح من متغيرات البيئة ==========
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# ========== (1) الإعدادات ==========
-TELEGRAM_TOKEN = "8745236717:AAGjIacCY4SC2CtIFqDQAv5oZUEInFBg-Nk"
-OPENROUTER_KEY = "sk-or-v1-..."  # ← حط مفتاح OpenRouter هنا
+# التحقق من وجود المفاتيح
+if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+    raise ValueError("❌ ناقص متغيرات البيئة! شغل: export TELEGRAM_TOKEN=... && export GROQ_API_KEY=...")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# ============================================================
 
+client = groq.Groq(api_key=GROQ_API_KEY)
 conversations = {}
 
-# ========== (2) الإعدادات العامة ==========
-MAX_HISTORY = 10
-RATE_LIMIT_SEC = 2
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# ========== (3) الشخصيات ==========
+# الشخصيات
 PERSONAS = {
     "🤖 افتراضي": "أنت مساعد ذكي ومفيد. أجب بوضوح وباللغة العربية.",
     "😂 مضحك": "أنت كوميدي ومضحك. أجب بطريقة مرحة وخفيفة، واستخدم النكت.",
     "👨‍🍳 شيف": "أنت شيف محترف. أجب عن أسئلة الطبخ والوصفات والمكونات.",
     "💻 مبرمج": "أنت خبير برمجة. أجب عن أسئلة الكود والتقنية بدقة.",
     "🧠 طبيب نفسي": "أنت طبيب نفسي. استمع جيداً وأجب بتعاطف وحكمة.",
-    "📚 معلم": "أنت معلم شرح. أجب بطريقة تعليمية بسيطة وواضحة.",
+    "📚 معلم": "أنت معلم شرح. أجب بطريقة تعليمية بسيطة وواضحة."
 }
 
-# ========== (4) لوحة المفاتيح ==========
 def get_main_keyboard():
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🤖 افتراضي", "😂 مضحك")
-    markup.row("👨‍🍳 شيف", "💻 مبرمج")
-    markup.row("🧠 طبيب نفسي", "📚 معلم")
-    markup.row("🗑 مسح الذاكرة", "❓ مساعدة")
-    return markup
+    buttons = [
+        [KeyboardButton("🤖 افتراضي"), KeyboardButton("😂 مضحك")],
+        [KeyboardButton("👨‍🍳 شيف"), KeyboardButton("💻 مبرمج")],
+        [KeyboardButton("🧠 طبيب نفسي"), KeyboardButton("📚 معلم")],
+        [KeyboardButton("🗑 مسح الذاكرة")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ========== (5) دالة OpenRouter ==========
-def ask_ai(prompt):
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "google/gemini-1.5-flash",
-            "messages": [{"role": "user", "content": prompt}]
-        }
-    )
-    return response.json()["choices"][0]["message"]["content"]
-
-# ========== (6) الأوامر ==========
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": deque(maxlen=MAX_HISTORY), "last": 0}
-    
-    bot.send_message(
-        user_id,
-        "🌟 *أهلاً بك في البوت الذكي!*\n\n"
-        "أنا بوت متعدد الشخصيات يعمل بـ *Gemini AI*.\n"
-        "• اختر شخصية من الأسفل\n"
-        "• أو اكتب سؤالك مباشرة\n"
-        "• استخدم *مسح الذاكرة* لبدء محادثة جديدة\n\n"
-        "_ملاحظة: الذاكرة محدودة بآخر 10 رسائل._",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(),
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
+    await update.message.reply_text(
+        "🌟 **أهلاً بك في البوت الأسطوري!**\n\n"
+        "أنا بوت شامل بستخدم GROQ، أستطيع الرد على أي سؤال.\n"
+        "اختر شخصية من الأسفل، أو اكتب رسالتك مباشرة.",
+        reply_markup=get_main_keyboard()
     )
 
-@bot.message_handler(commands=['help'])
-def help_cmd(message):
-    text = (
-        "📖 *كيفية الاستخدام:*\n\n"
-        "1️⃣ اختر شخصية من الأزرار\n"
-        "2️⃣ اكتب سؤالك\n"
-        "3️⃣ البوت يتذكر السياق (آخر 10 رسائل)\n\n"
-        "⚡ *الأوامر:*\n"
-        "/start - بدء البوت\n"
-        "/help - هذا المساعدة\n\n"
-        "🧹 *مسح الذاكرة* - لمسح السياق الحالي"
-    )
-    bot.send_message(message.from_user.id, text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_text = update.message.text
 
-# ========== (7) المعالجة ==========
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    user_id = message.from_user.id
-    user_text = message.text
-    
-    now = time.time()
-    conv = conversations.get(user_id)
-    if conv and (now - conv.get("last", 0)) < RATE_LIMIT_SEC:
-        bot.send_message(user_id, "⏳ *بطّل شوي...*", parse_mode="Markdown")
-        return
-    
     if user_text in PERSONAS:
-        conversations[user_id] = {"persona": PERSONAS[user_text], "history": deque(maxlen=MAX_HISTORY), "last": now}
-        bot.send_message(user_id, f"✅ تم تغيير الشخصية إلى: *{user_text}*", parse_mode="Markdown", reply_markup=get_main_keyboard())
+        conversations[user_id] = {"persona": PERSONAS[user_text], "history": []}
+        await update.message.reply_text(
+            f"✅ تم تغيير الشخصية إلى: {user_text}",
+            reply_markup=get_main_keyboard()
+        )
         return
-    
-    if user_text == "🗑 مسح الذاكرة":
-        p = conv["persona"] if conv else PERSONAS["🤖 افتراضي"]
-        conversations[user_id] = {"persona": p, "history": deque(maxlen=MAX_HISTORY), "last": now}
-        bot.send_message(user_id, "🧹 تم مسح الذاكرة.", reply_markup=get_main_keyboard())
-        return
-    
-    if user_text == "❓ مساعدة":
-        help_cmd(message)
-        return
-    
-    if user_id not in conversations:
-        conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": deque(maxlen=MAX_HISTORY), "last": now}
-    
-    conv = conversations[user_id]
-    conv["last"] = now
-    
-    # بناء المحادثة
-    history_text = ""
-    for turn in conv["history"]:
-        history_text += f"المستخدم: {turn['user']}\nأنت: {turn['bot']}\n\n"
-    
-    full_prompt = (
-        f"التعليمات: {conv['persona']}\n\n"
-        f"محادثة سابقة:\n{history_text}\n"
-        f"المستخدم الآن: {user_text}\n\n"
-        f"أجب الآن:"
-    )
-    
-    try:
-        reply = ask_ai(full_prompt)
-        conv["history"].append({"user": user_text, "bot": reply})
-        
-        if len(reply) > 4096:
-            for i in range(0, len(reply), 4096):
-                bot.send_message(user_id, reply[i:i+4096], reply_markup=get_main_keyboard())
-        else:
-            bot.send_message(user_id, reply, reply_markup=get_main_keyboard())
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        bot.send_message(user_id, "⚠️ حدث خطأ تقني. جرّب مرة أخرى.", reply_markup=get_main_keyboard())
 
-# ========== (8) التشغيل ==========
-print("✅ البوت شغال...")
-bot.polling(none_stop=True)
+    if user_text == "🗑 مسح الذاكرة":
+        persona = conversations.get(user_id, {}).get("persona", PERSONAS["🤖 افتراضي"])
+        conversations[user_id] = {"persona": persona, "history": []}
+        await update.message.reply_text(
+            "🧹 تم مسح الذاكرة.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    if user_id not in conversations:
+        conversations[user_id] = {"persona": PERSONAS["🤖 افتراضي"], "history": []}
+
+    user_data = conversations[user_id]
+
+    messages = [{"role": "system", "content": user_data['persona']}]
+    
+    for entry in user_data["history"][-10:]:
+        messages.append({"role": "user", "content": entry["user"]})
+        messages.append({"role": "assistant", "content": entry["bot"]})
+    
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing"
+        )
+
+        chat_completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024
+        )
+
+        reply = chat_completion.choices[0].message.content
+        user_data["history"].append({"user": user_text, "bot": reply})
+        
+        if len(user_data["history"]) > 50:
+            user_data["history"] = user_data["history"][-50:]
+
+        await update.message.reply_text(reply, reply_markup=get_main_keyboard())
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        await update.message.reply_text(
+            f"⚠️ صار خطأ: {str(e)}",
+            reply_markup=get_main_keyboard()
+        )
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("✅ البوت شغال...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
