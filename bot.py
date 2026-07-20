@@ -1,25 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-بوت تخزين ملفات على تليجرام - واجهة عربية كاملة
+بوت تخزين ملفات على تليجرام - نسخة آمنة ومُحسّنة
 =================================================
-الفكرة: تليجرام نفسه يخزّن الملفات على سيرفراته، والبوت فقط يحفظ "مرجع" (file_id)
-لكل ملف داخل قاعدة بيانات SQLite محلية. هيك ما في حد أقصى لعدد الملفات أو
-المساحة الكلية، لأنك ما بتستهلك تخزين عندك أبدًا.
-
-المتطلبات:
-    pip install python-telegram-bot requests --upgrade
-
-التشغيل:
-    python storage_bot.py
-    (التوكن ومفتاح Groq محطوطين مباشرة بالأسفل - عدّل عليهم إذا لزم)
 """
 
 import os
+import re
 import sqlite3
 import logging
 import asyncio
-import requests
+import aiohttp
 from datetime import datetime
+from functools import wraps
 
 from telegram import (
     Update,
@@ -37,7 +29,7 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# الإعدادات العامة
+# الإعدادات العامة - آمنة بمتغيرات البيئة
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -46,16 +38,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ⚠️ لا تشارك هاد الملف مع حدا ولا ترفعه على GitHub عام - فيه مفاتيحك الخاصة
-BOT_TOKEN = "8745236717:AAGjIacCY4SC2CtIFqDQAv5oZUEInFBg-Nk"
-GROQ_API_KEY = "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"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# ✅ آمن: متغيرات بيئة بدل مفاتيح مكشوفة
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-DB_PATH = "storage_bot.db"
-PAGE_SIZE = 6  # عدد الملفات بكل صفحة عرض
+# ✅ أضفنا: قائمة المستخدمين المسموح لهم (whitelist)
+ALLOWED_USERS = set(
+    int(uid.strip()) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid.strip()
+)
 
-# نصوص الأزرار الرئيسية (لوحة المفاتيح السفلية)
+# ✅ أضفنا: حدود الملفات
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_FILES_PER_USER = 1000
+RATE_LIMIT_SECONDS = 2  # بين كل طلب وطلب
+
+DB_PATH = os.getenv("DB_PATH", "storage_bot.db")
+PAGE_SIZE = 6
+
+# التحقق من الإعدادات
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN مش محدد! حطه بمتغير البيئة.")
+if not GROQ_API_KEY:
+    logger.warning("⚠️ GROQ_API_KEY مش محدد - وضع الدردشة رح يكون معطل.")
+
+# نصوص الأزرار
 BTN_MY_FILES = "📂 ملفاتي"
 BTN_SEARCH = "🔍 بحث عن ملف"
 BTN_STATS = "📊 الإحصائيات"
@@ -73,7 +81,6 @@ CHAT_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# تعليمات المساعد الذكي - مضبوطة لتكون مناسبة للأطفال وآمنة
 KID_SAFE_SYSTEM_PROMPT = (
     "انت مساعد ذكي ولطيف بيحكي بالعربي مع طفل. "
     "جاوب دايمًا بأسلوب بسيط، إيجابي، ومناسب لعمر الأطفال. "
@@ -84,126 +91,175 @@ KID_SAFE_SYSTEM_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
-# قاعدة البيانات
+# ✅ Rate Limiting Decorator
 # ---------------------------------------------------------------------------
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def rate_limit(seconds=RATE_LIMIT_SECONDS):
+    """Decorator لمنع flood"""
+    last_call = {}
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            now = datetime.utcnow().timestamp()
+            if user_id in last_call and (now - last_call[user_id]) < seconds:
+                await update.message.reply_text(
+                    "⏳ خفف شوي... جرب بعد {} ثانية.".format(int(seconds - (now - last_call[user_id])))
+                )
+                return
+            last_call[user_id] = now
+            return await func(update, context)
+        return wrapper
+    return decorator
 
 
-def init_db():
-    conn = db_connect()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            file_name TEXT,
-            file_size INTEGER,
-            caption TEXT,
-            created_at TEXT NOT NULL
+# ---------------------------------------------------------------------------
+# ✅ Authorization Decorator
+# ---------------------------------------------------------------------------
+
+def authorized_only(func):
+    """يسمح فقط للمستخدمين المصرح لهم"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+            await update.message.reply_text("🚫 ممنوع الدخول! تواصل مع المسؤول.")
+            logger.warning("محاولة دخول غير مصرح: user_id=%s", user_id)
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# قاعدة البيانات - مع Connection Pooling
+# ---------------------------------------------------------------------------
+
+class Database:
+    """✅ Connection pool محسّن"""
+    _instance = None
+    _conn = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            cls._conn.row_factory = sqlite3.Row
+            cls._init_tables()
+        return cls._instance
+    
+    @classmethod
+    def _init_tables(cls):
+        cls._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_name TEXT,
+                file_size INTEGER DEFAULT 0,
+                caption TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        cls._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_id ON files(user_id)"
+        )
+        cls._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_search ON files(user_id, file_name, caption)"
+        )
+        cls._conn.commit()
+    
+    def execute(self, query, params=()):
+        cursor = self._conn.execute(query, params)
+        self._conn.commit()
+        return cursor
+    
+    def fetchall(self, query, params=()):
+        return self._conn.execute(query, params).fetchall()
+    
+    def fetchone(self, query, params=()):
+        return self._conn.execute(query, params).fetchone()
+
+
+db = Database()
 
 
 def add_file(user_id, file_id, file_type, file_name, file_size, caption):
-    conn = db_connect()
-    conn.execute(
+    # ✅ التحقق من عدد الملفات
+    count = db.fetchone(
+        "SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,)
+    )[0]
+    if count >= MAX_FILES_PER_USER:
+        raise ValueError("وصلت للحد الأقصى ({}) من الملفات!".format(MAX_FILES_PER_USER))
+    
+    db.execute(
         """
         INSERT INTO files (user_id, file_id, file_type, file_name, file_size, caption, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            user_id,
-            file_id,
-            file_type,
-            file_name,
-            file_size or 0,
-            caption,
-            datetime.utcnow().isoformat(),
-        ),
+        (user_id, file_id, file_type, file_name, file_size or 0, caption, datetime.utcnow().isoformat()),
     )
-    conn.commit()
-    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.close()
-    return new_id
+    return db.fetchone("SELECT last_insert_rowid()")[0]
 
 
 def get_user_files(user_id, offset=0, limit=PAGE_SIZE, search=None):
-    conn = db_connect()
+    # ✅ آمن: parameterized queries بدون f-string
     if search:
-        rows = conn.execute(
+        search_pattern = "%{}%".format(search.replace("%", "\\%").replace("_", "\\_"))
+        return db.fetchall(
             """
             SELECT * FROM files
-            WHERE user_id = ? AND (file_name LIKE ? OR caption LIKE ?)
+            WHERE user_id = ? AND (file_name LIKE ? ESCAPE '\\' OR caption LIKE ? ESCAPE '\\')
             ORDER BY id DESC LIMIT ? OFFSET ?
             """,
-            (user_id, f"%{search}%", f"%{search}%", limit, offset),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM files WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
-        ).fetchall()
-    conn.close()
-    return rows
+            (user_id, search_pattern, search_pattern, limit, offset),
+        )
+    return db.fetchall(
+        "SELECT * FROM files WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        (user_id, limit, offset),
+    )
 
 
 def count_user_files(user_id, search=None):
-    conn = db_connect()
     if search:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE user_id = ? AND (file_name LIKE ? OR caption LIKE ?)",
-            (user_id, f"%{search}%", f"%{search}%"),
-        ).fetchone()[0]
-    else:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,)
-        ).fetchone()[0]
-    conn.close()
-    return total
+        search_pattern = "%{}%".format(search.replace("%", "\\%").replace("_", "\\_"))
+        return db.fetchone(
+            "SELECT COUNT(*) FROM files WHERE user_id = ? AND (file_name LIKE ? ESCAPE '\\' OR caption LIKE ? ESCAPE '\\')",
+            (user_id, search_pattern, search_pattern),
+        )[0]
+    return db.fetchone("SELECT COUNT(*) FROM files WHERE user_id = ?", (user_id,))[0]
 
 
 def get_file_by_id(row_id, user_id):
-    conn = db_connect()
-    row = conn.execute(
+    return db.fetchone(
         "SELECT * FROM files WHERE id = ? AND user_id = ?", (row_id, user_id)
-    ).fetchone()
-    conn.close()
-    return row
+    )
 
 
 def delete_file(row_id, user_id):
-    conn = db_connect()
-    conn.execute("DELETE FROM files WHERE id = ? AND user_id = ?", (row_id, user_id))
-    conn.commit()
-    conn.close()
+    db.execute("DELETE FROM files WHERE id = ? AND user_id = ?", (row_id, user_id))
 
 
 def get_stats(user_id):
-    conn = db_connect()
-    row = conn.execute(
+    return db.fetchone(
         "SELECT COUNT(*) as cnt, COALESCE(SUM(file_size),0) as total_size FROM files WHERE user_id = ?",
         (user_id,),
-    ).fetchone()
-    conn.close()
-    return row["cnt"], row["total_size"]
+    )
 
+
+# ---------------------------------------------------------------------------
+# دوال مساعدة
+# ---------------------------------------------------------------------------
 
 def human_size(num_bytes):
     step = 1024.0
     for unit in ["بايت", "كيلوبايت", "ميغابايت", "غيغابايت", "تيرابايت"]:
         if num_bytes < step:
-            return f"{num_bytes:.1f} {unit}"
+            return "{:.1f} {}".format(num_bytes, unit)
         num_bytes /= step
-    return f"{num_bytes:.1f} بيتابايت"
+    return "{:.1f} بيتابايت".format(num_bytes)
 
 
 TYPE_LABELS = {
@@ -215,8 +271,18 @@ TYPE_LABELS = {
     "animation": "🎞️ صورة متحركة",
 }
 
+
+# ✅ التحقق من file_id
+FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+def validate_file_id(file_id):
+    if not file_id or len(file_id) > 500:
+        return False
+    return bool(FILE_ID_PATTERN.match(file_id))
+
+
 # ---------------------------------------------------------------------------
-# دوال مساعدة لبناء لوحات الملفات
+# بناء لوحات الملفات
 # ---------------------------------------------------------------------------
 
 def build_files_page(user_id, offset=0, search=None):
@@ -227,23 +293,23 @@ def build_files_page(user_id, offset=0, search=None):
         text = "🚫 ما في ولا ملف محفوظ حاليًا." if not search else "🚫 ما لقيت أي ملف يطابق البحث."
         return text, None
 
-    header = f"📂 ملفاتك ({total} ملف)" if not search else f"🔍 نتائج البحث عن: {search} ({total})"
+    header = "📂 ملفاتك ({} ملف)".format(total) if not search else "🔍 نتائج البحث عن: {} ({})".format(search, total)
     lines = [header, ""]
     buttons = []
     for row in rows:
         label = TYPE_LABELS.get(row["file_type"], "📎 ملف")
         name = row["file_name"] or "بدون اسم"
         size = human_size(row["file_size"] or 0)
-        lines.append(f"{label} | {name} | {size}")
+        lines.append("{} | {} | {}".format(label, name, size))
         buttons.append(
-            [InlineKeyboardButton(f"📥 {name[:25]}", callback_data=f"get:{row['id']}")]
+            [InlineKeyboardButton("📥 {}".format(name[:25]), callback_data="get:{}".format(row["id"]))]
         )
 
     nav_row = []
     if offset > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"page:{max(offset-PAGE_SIZE,0)}:{search or ''}"))
+        nav_row.append(InlineKeyboardButton("⬅️ السابق", callback_data="page:{}:{}".format(max(offset-PAGE_SIZE,0), search or "")))
     if offset + PAGE_SIZE < total:
-        nav_row.append(InlineKeyboardButton("التالي ➡️", callback_data=f"page:{offset+PAGE_SIZE}:{search or ''}"))
+        nav_row.append(InlineKeyboardButton("التالي ➡️", callback_data="page:{}:{}".format(offset+PAGE_SIZE, search or "")))
     if nav_row:
         buttons.append(nav_row)
 
@@ -252,19 +318,22 @@ def build_files_page(user_id, offset=0, search=None):
 
 def build_file_actions(row_id):
     buttons = [
-        [InlineKeyboardButton("🗑️ حذف هذا الملف", callback_data=f"del:{row_id}")]
+        [InlineKeyboardButton("🗑️ حذف هذا الملف", callback_data="del:{}".format(row_id))]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 # ---------------------------------------------------------------------------
-# الذكاء الاصطناعي (Groq) - دردشة آمنة للأطفال
+# ✅ الذكاء الاصطناعي - async مع aiohttp
 # ---------------------------------------------------------------------------
 
-def call_groq(user_message: str) -> str:
-    """استدعاء Groq API والحصول على رد نصي (استدعاء متزامن، بيشتغل بخيط منفصل)."""
+async def call_groq(user_message: str) -> str:
+    """✅ async HTTP بدل requests المتزامن"""
+    if not GROQ_API_KEY:
+        return "⚠️ وضع الدردشة معطل حالياً."
+    
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": "Bearer {}".format(GROQ_API_KEY),
         "Content-Type": "application/json",
     }
     payload = {
@@ -276,12 +345,21 @@ def call_groq(user_message: str) -> str:
         "temperature": 0.6,
         "max_tokens": 400,
     }
+    
     try:
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:  # noqa: BLE001
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(GROQ_URL, headers=headers, json=payload, ssl=True) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except aiohttp.ClientSSLError:
+        logger.error("SSL Error مع Groq")
+        return "⚠️ مشكلة بالاتصال الآمن، جرب مرة ثانية."
+    except asyncio.TimeoutError:
+        logger.error("Timeout مع Groq")
+        return "⏳ الاتصال بطيء، جرب بعد شوي."
+    except Exception as exc:
         logger.error("خطأ بالاتصال مع Groq: %s", exc)
         return "⚠️ صار في مشكلة بسيطة بالاتصال، جرب مرة ثانية بعد شوي."
 
@@ -296,27 +374,29 @@ async def start_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
-    reply = await asyncio.to_thread(call_groq, update.message.text)
+    reply = await call_groq(update.message.text)
     await update.message.reply_text(reply, reply_markup=CHAT_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
-# أوامر البوت
+# ✅ الأوامر - مع Authorization و Rate Limiting
 # ---------------------------------------------------------------------------
 
+@authorized_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "صديقي"
     text = (
-        f"👋 أهلًا فيك يا {name}!\n\n"
+        "👋 أهلًا فيك يا {}!\n\n"
         "أنا بوت التخزين الخاص فيك 📦\n"
         "ابعتلي أي ملف (صورة، فيديو، صوت، مستند...) وراح احفظه إلك فورًا،\n"
         "وتقدر ترجعله بأي وقت من زر «📂 ملفاتي».\n\n"
         "✨ ما في حد أقصى لعدد الملفات يلي احفظها إلك!\n\n"
         "اختار من الأزرار تحت 👇"
-    )
+    ).format(name)
     await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
 
+@authorized_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "❓ *كيف تستخدم البوت:*\n\n"
@@ -331,33 +411,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
+@authorized_only
+@rate_limit(1)
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    count, total_size = get_stats(user_id)
+    row = get_stats(user_id)
+    count, total_size = row["cnt"], row["total_size"]
     text = (
         "📊 *إحصائيات التخزين*\n\n"
-        f"📁 عدد الملفات: {count}\n"
-        f"💾 الحجم الكلي: {human_size(total_size)}\n\n"
+        "📁 عدد الملفات: {}\n"
+        "💾 الحجم الكلي: {}\n\n"
         "✅ التخزين غير محدود — استمر بإرسال ملفاتك بكل راحة."
-    )
+    ).format(count, human_size(total_size))
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
+@authorized_only
 async def my_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text, markup = build_files_page(user_id, offset=0)
     await update.message.reply_text(text, reply_markup=markup or MAIN_KEYBOARD)
 
 
+@authorized_only
 async def ask_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_search"] = True
     await update.message.reply_text("🔍 اكتبلي الكلمة أو اسم الملف يلي بدك تدور عليه:")
 
 
 # ---------------------------------------------------------------------------
-# استقبال الملفات وحفظها
+# ✅ استقبال الملفات - مع التحقق من الحجم والـ file_id
 # ---------------------------------------------------------------------------
 
+@authorized_only
+@rate_limit(1)
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user_id = update.effective_user.id
@@ -376,63 +463,80 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
     elif message.video:
         file_type = "video"
         file_id = message.video.file_id
-        file_name = message.video.file_name or f"video_{message.message_id}.mp4"
+        file_name = message.video.file_name or "video_{}.mp4".format(message.message_id)
         file_size = message.video.file_size
     elif message.audio:
         file_type = "audio"
         file_id = message.audio.file_id
-        file_name = message.audio.file_name or (message.audio.title or f"audio_{message.message_id}.mp3")
+        file_name = message.audio.file_name or (message.audio.title or "audio_{}.mp3".format(message.message_id))
         file_size = message.audio.file_size
     elif message.voice:
         file_type = "voice"
         file_id = message.voice.file_id
-        file_name = f"voice_{message.message_id}.ogg"
+        file_name = "voice_{}.ogg".format(message.message_id)
         file_size = message.voice.file_size
     elif message.animation:
         file_type = "animation"
         file_id = message.animation.file_id
-        file_name = message.animation.file_name or f"gif_{message.message_id}.mp4"
+        file_name = message.animation.file_name or "gif_{}.mp4".format(message.message_id)
         file_size = message.animation.file_size
     elif message.photo:
         file_type = "photo"
         largest = message.photo[-1]
         file_id = largest.file_id
-        file_name = f"photo_{message.message_id}.jpg"
+        file_name = "photo_{}.jpg".format(message.message_id)
         file_size = largest.file_size
 
     if not file_id:
         await message.reply_text("⚠️ ما قدرت أتعرف على نوع الملف، جرب ترسله من نوع تاني.")
         return
 
-    row_id = add_file(user_id, file_id, file_type, file_name, file_size, caption)
+    # ✅ التحقق من file_id
+    if not validate_file_id(file_id):
+        await message.reply_text("⚠️ معرف الملف غير صالح.")
+        return
+
+    # ✅ التحقق من حجم الملف
+    if file_size and file_size > MAX_FILE_SIZE:
+        await message.reply_text(
+            "❌ الملف كبير جدًا! الحد الأقصى هو {}.".format(human_size(MAX_FILE_SIZE))
+        )
+        return
+
+    try:
+        row_id = add_file(user_id, file_id, file_type, file_name, file_size, caption)
+    except ValueError as e:
+        await message.reply_text("❌ {}".format(str(e)), reply_markup=MAIN_KEYBOARD)
+        return
 
     label = TYPE_LABELS.get(file_type, "📎 ملف")
     text = (
         "✅ تم الحفظ بنجاح!\n\n"
-        f"{label}\n"
-        f"📌 الاسم: {file_name}\n"
-        f"💾 الحجم: {human_size(file_size or 0)}\n"
-        + (f"📝 الوصف: {caption}\n" if caption else "")
-        + f"\n🔢 رقم الملف: #{row_id}"
-    )
+        "{}\n"
+        "📌 الاسم: {}\n"
+        "💾 الحجم: {}\n"
+    ).format(label, file_name, human_size(file_size or 0))
+    if caption:
+        text += "📝 الوصف: {}\n".format(caption)
+    text += "\n🔢 رقم الملف: #{}".format(row_id)
+    
     await message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
-# استقبال الرسائل النصية (أزرار لوحة المفاتيح + البحث)
+# ✅ استقبال الرسائل النصية
 # ---------------------------------------------------------------------------
 
+@authorized_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # الخروج من وضع الدردشة متاح بأي وقت
     if text == BTN_EXIT_CHAT:
         context.user_data["in_chat"] = False
         await update.message.reply_text("✅ رجعناك للقائمة الرئيسية.", reply_markup=MAIN_KEYBOARD)
         return
 
-    # إذا المستخدم بوضع الدردشة، حوّل كل رسالة لـ Groq مباشرة
     if context.user_data.get("in_chat"):
         await handle_chat_message(update, context)
         return
@@ -461,88 +565,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# الأزرار التفاعلية (Inline Buttons)
+# ✅ الأزرار التفاعلية
 # ---------------------------------------------------------------------------
 
+@authorized_only
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    data = query.data
-
-    if data.startswith("page:"):
-        _, offset, search = data.split(":", 2)
-        offset = int(offset)
-        search = search or None
-        text, markup = build_files_page(user_id, offset=offset, search=search)
-        await query.edit_message_text(text, reply_markup=markup)
-
-    elif data.startswith("get:"):
-        row_id = int(data.split(":", 1)[1])
-        row = get_file_by_id(row_id, user_id)
-        if not row:
-            await query.message.reply_text("⚠️ ما لقيت هاد الملف، ممكن يكون انحذف.")
-            return
-
-        caption = f"📌 {row['file_name']}\n💾 {human_size(row['file_size'] or 0)}"
-        if row["caption"]:
-            caption += f"\n📝 {row['caption']}"
-
-        ftype = row["file_type"]
-        fid = row["file_id"]
-        chat_id = query.message.chat_id
-        markup = build_file_actions(row_id)
-
-        if ftype == "document":
-            await context.bot.send_document(chat_id, fid, caption=caption, reply_markup=markup)
-        elif ftype == "photo":
-            await context.bot.send_photo(chat_id, fid, caption=caption, reply_markup=markup)
-        elif ftype == "video":
-            await context.bot.send_video(chat_id, fid, caption=caption, reply_markup=markup)
-        elif ftype == "audio":
-            await context.bot.send_audio(chat_id, fid, caption=caption, reply_markup=markup)
-        elif ftype == "voice":
-            await context.bot.send_voice(chat_id, fid, caption=caption, reply_markup=markup)
-        elif ftype == "animation":
-            await context.bot.send_animation(chat_id, fid, caption=caption, reply_markup=markup)
-
-    elif data.startswith("del:"):
-        row_id = int(data.split(":", 1)[1])
-        delete_file(row_id, user_id)
-        await query.message.reply_text("🗑️ تم حذف الملف من قائمتك بنجاح.")
-
-
-# ---------------------------------------------------------------------------
-# التشغيل
-# ---------------------------------------------------------------------------
-
-def main():
-    init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("files", my_files))
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL
-            | filters.PHOTO
-            | filters.VIDEO
-            | filters.AUDIO
-            | filters.VOICE
-            | filters.ANIMATION,
-            handle_incoming_file,
-        )
-    )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-
-    logger.info("🚀 البوت شغّال الآن...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    data = query.dat
