@@ -1,15 +1,4 @@
-# Core
 python-telegram-bot==21.4
-
-# Async HTTP (بدل requests)
 aiohttp==3.9.5
-
-# Async Database
 aiosqlite==0.20.0
-
-# Environment Variables
-python-dotenv==1.0.1
-
-# Optional: Webhook (إذا بدك Flask)
-# flask==3.0.3
-# gunicorn==23.0.0
+python-dotenv==1.0.
